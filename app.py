@@ -1,9 +1,10 @@
 """
-AlphaFold Explorer — Protein Structure Viewer
-Streamlit app for looking up protein structures from the AlphaFold DB
-and folding novel sequences via ESMFold (Meta).
+AlphaFold Explorer — Protein Structure Viewer & Analysis Suite
+Streamlit app for looking up protein structures from the AlphaFold DB,
+folding novel sequences via ESMFold, and comprehensive protein analysis.
 
-Phase 2 features: batch fold, compare, domain annotation, PDF export, local ESM-2.
+Features: lookup, fold, batch fold, compare, PDB upload, sequence properties,
+domain annotation, Ramachandran plot, hydrophobicity, PDF export, local ESM-2.
 
 Usage:
     pip install -r requirements.txt
@@ -14,8 +15,11 @@ from __future__ import annotations
 import csv
 import datetime
 import json
+import math
 import re
+import tempfile
 from io import BytesIO, StringIO
+from collections import Counter
 
 import numpy as np
 import plotly.express as px
@@ -28,6 +32,21 @@ ALPHAFOLD_API = "https://alphafold.ebi.ac.uk/api"
 ESMFOLD_API = "https://api.esmatlas.com/foldSequence/v1/pdb/"
 UNIPROT_API = "https://rest.uniprot.org/uniprotkb"
 DOMAIN_FEATURE_TYPES = {"Domain", "Region", "Motif", "Zinc finger", "DNA binding"}
+
+THREE_TO_ONE = {
+    "ALA": "A", "CYS": "C", "ASP": "D", "GLU": "E", "PHE": "F",
+    "GLY": "G", "HIS": "H", "ILE": "I", "LYS": "K", "LEU": "L",
+    "MET": "M", "ASN": "N", "PRO": "P", "GLN": "Q", "ARG": "R",
+    "SER": "S", "THR": "T", "VAL": "V", "TRP": "W", "TYR": "Y",
+}
+
+# Kyte-Doolittle hydrophobicity scale
+KD_SCALE = {
+    "A": 1.8, "R": -4.5, "N": -3.5, "D": -3.5, "C": 2.5,
+    "Q": -3.5, "E": -3.5, "G": -0.4, "H": -3.2, "I": 4.5,
+    "L": 3.8, "K": -3.9, "M": 1.9, "F": 2.8, "P": -1.6,
+    "S": -0.8, "T": -0.7, "W": -0.9, "Y": -1.3, "V": 4.2,
+}
 
 st.set_page_config(
     page_title="AlphaFold Explorer",
@@ -45,7 +64,7 @@ except ImportError:
     LOCAL_ESM_AVAILABLE = False
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────
+# ── Helpers: Sequence ───────────────────────────────────────────────────
 
 def clean_sequence(seq: str) -> str:
     """Strip whitespace, numbers, FASTA headers. Return uppercase amino acids only."""
@@ -95,6 +114,15 @@ def validate_sequence(seq: str) -> tuple[bool, str]:
     return True, "OK"
 
 
+def extract_sequence_from_pdb(pdb_text: str) -> str:
+    """Extract amino acid sequence from PDB CA atoms."""
+    residues = parse_plddt_from_pdb(pdb_text)
+    return "".join(THREE_TO_ONE.get(r["residue_name"], "X") for r in residues)
+
+
+# ── Helpers: API (cached) ──────────────────────────────────────────────
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_alphafold_prediction(uniprot_id: str) -> dict | None:
     """Fetch AlphaFold prediction metadata from EBI."""
     url = f"{ALPHAFOLD_API}/prediction/{uniprot_id}"
@@ -105,28 +133,25 @@ def fetch_alphafold_prediction(uniprot_id: str) -> dict | None:
     return None
 
 
-def fetch_alphafold_pdb(prediction: dict) -> str | None:
-    """Fetch PDB file from AlphaFold DB using URL from prediction metadata."""
-    url = prediction.get("pdbUrl")
-    if not url:
-        return None
-    resp = requests.get(url, timeout=15)
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_alphafold_pdb(pdb_url: str) -> str | None:
+    """Fetch PDB file from AlphaFold DB."""
+    resp = requests.get(pdb_url, timeout=15)
     if resp.status_code == 200:
         return resp.text
     return None
 
 
-def fetch_alphafold_pae(prediction: dict) -> dict | None:
-    """Fetch PAE (Predicted Aligned Error) JSON using URL from prediction metadata."""
-    url = prediction.get("paeDocUrl")
-    if not url:
-        return None
-    resp = requests.get(url, timeout=15)
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_alphafold_pae(pae_url: str) -> dict | None:
+    """Fetch PAE JSON from AlphaFold DB."""
+    resp = requests.get(pae_url, timeout=15)
     if resp.status_code == 200:
         return resp.json()
     return None
 
 
+@st.cache_data(ttl=600, show_spinner=False)
 def fold_with_esmfold(sequence: str) -> str | None:
     """Fold a sequence using ESMFold API. Returns PDB string."""
     resp = requests.post(
@@ -140,6 +165,7 @@ def fold_with_esmfold(sequence: str) -> str | None:
     return None
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def search_uniprot(query: str, limit: int = 10) -> list[dict]:
     """Search UniProt for protein entries."""
     url = f"{UNIPROT_API}/search"
@@ -163,6 +189,7 @@ def search_uniprot(query: str, limit: int = 10) -> list[dict]:
     return []
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_uniprot_domains(uniprot_id: str) -> list[dict]:
     """Fetch domain annotations from UniProt REST API."""
     url = f"{UNIPROT_API}/{uniprot_id}.json"
@@ -190,6 +217,8 @@ def fetch_uniprot_domains(uniprot_id: str) -> list[dict]:
         return []
 
 
+# ── Helpers: PDB Parsing ───────────────────────────────────────────────
+
 def parse_plddt_from_pdb(pdb_text: str) -> list[dict]:
     """Extract per-residue pLDDT from B-factor column of PDB (AlphaFold convention)."""
     residues = {}
@@ -208,16 +237,127 @@ def parse_plddt_from_pdb(pdb_text: str) -> list[dict]:
     return [residues[k] for k in sorted(residues.keys())]
 
 
+def parse_backbone_atoms(pdb_text: str) -> dict[int, dict[str, tuple[float, float, float]]]:
+    """Parse N, CA, C backbone atom coordinates per residue."""
+    backbone = {}
+    for line in pdb_text.split("\n"):
+        if not line.startswith("ATOM"):
+            continue
+        atom_name = line[12:16].strip()
+        if atom_name not in ("N", "CA", "C"):
+            continue
+        res_num = int(line[22:26].strip())
+        x = float(line[30:38].strip())
+        y = float(line[38:46].strip())
+        z = float(line[46:54].strip())
+        if res_num not in backbone:
+            backbone[res_num] = {}
+        backbone[res_num][atom_name] = (x, y, z)
+    return backbone
+
+
+def _dihedral(p0, p1, p2, p3):
+    """Calculate dihedral angle between four points in degrees."""
+    b0 = np.array(p0) - np.array(p1)
+    b1 = np.array(p2) - np.array(p1)
+    b2 = np.array(p3) - np.array(p2)
+    b1 /= np.linalg.norm(b1)
+    v = b0 - np.dot(b0, b1) * b1
+    w = b2 - np.dot(b2, b1) * b1
+    x = np.dot(v, w)
+    y = np.dot(np.cross(b1, v), w)
+    return math.degrees(math.atan2(y, x))
+
+
+def calculate_phi_psi(pdb_text: str) -> list[tuple[float, float]]:
+    """Calculate phi/psi dihedral angles from PDB backbone atoms."""
+    backbone = parse_backbone_atoms(pdb_text)
+    res_nums = sorted(backbone.keys())
+    angles = []
+    for i in range(1, len(res_nums) - 1):
+        prev_num = res_nums[i - 1]
+        curr_num = res_nums[i]
+        next_num = res_nums[i + 1]
+        prev = backbone.get(prev_num, {})
+        curr = backbone.get(curr_num, {})
+        nxt = backbone.get(next_num, {})
+        if all(k in prev for k in ("C",)) and all(k in curr for k in ("N", "CA", "C")) and all(k in nxt for k in ("N",)):
+            phi = _dihedral(prev["C"], curr["N"], curr["CA"], curr["C"])
+            psi = _dihedral(curr["N"], curr["CA"], curr["C"], nxt["N"])
+            angles.append((phi, psi))
+    return angles
+
+
+def parse_secondary_structure(pdb_text: str) -> dict:
+    """Parse HELIX and SHEET records from PDB to get secondary structure summary."""
+    helix_residues = 0
+    sheet_residues = 0
+    for line in pdb_text.split("\n"):
+        if line.startswith("HELIX"):
+            try:
+                start = int(line[21:25].strip())
+                end = int(line[33:37].strip())
+                helix_residues += max(0, end - start + 1)
+            except (ValueError, IndexError):
+                pass
+        elif line.startswith("SHEET"):
+            try:
+                start = int(line[22:26].strip())
+                end = int(line[33:37].strip())
+                sheet_residues += max(0, end - start + 1)
+            except (ValueError, IndexError):
+                pass
+    return {"helix": helix_residues, "sheet": sheet_residues}
+
+
+# ── Helpers: Sequence Analysis ─────────────────────────────────────────
+
+def compute_sequence_properties(sequence: str) -> dict:
+    """Compute biophysical properties using BioPython ProteinAnalysis."""
+    from Bio.SeqUtils.ProtParam import ProteinAnalysis
+    analysis = ProteinAnalysis(sequence)
+    aa_counts = analysis.count_amino_acids()
+    aa_percent = analysis.amino_acids_percent
+    return {
+        "length": len(sequence),
+        "molecular_weight": analysis.molecular_weight(),
+        "isoelectric_point": analysis.isoelectric_point(),
+        "gravy": analysis.gravy(),
+        "instability_index": analysis.instability_index(),
+        "aromaticity": analysis.aromaticity(),
+        "helix_fraction": analysis.secondary_structure_fraction()[0],
+        "turn_fraction": analysis.secondary_structure_fraction()[1],
+        "sheet_fraction": analysis.secondary_structure_fraction()[2],
+        "aa_counts": aa_counts,
+        "aa_percent": aa_percent,
+    }
+
+
+def compute_hydrophobicity(sequence: str, window: int = 9) -> list[tuple[int, float]]:
+    """Kyte-Doolittle hydrophobicity with sliding window."""
+    if len(sequence) < window:
+        return []
+    half = window // 2
+    values = []
+    for i in range(half, len(sequence) - half):
+        segment = sequence[i - half:i + half + 1]
+        score = sum(KD_SCALE.get(aa, 0) for aa in segment) / window
+        values.append((i + 1, score))
+    return values
+
+
+# ── Helpers: Visualization ─────────────────────────────────────────────
+
 def plddt_color(val: float) -> str:
     """AlphaFold confidence color scheme."""
     if val > 90:
-        return "#0053D6"  # Very high (blue)
+        return "#0053D6"
     elif val > 70:
-        return "#65CBF3"  # Confident (light blue)
+        return "#65CBF3"
     elif val > 50:
-        return "#FFDB13"  # Low (yellow)
+        return "#FFDB13"
     else:
-        return "#FF7D45"  # Very low (orange)
+        return "#FF7D45"
 
 
 def make_plddt_chart(residues: list[dict], domains: list[dict] | None = None) -> go.Figure:
@@ -227,8 +367,6 @@ def make_plddt_chart(residues: list[dict], domains: list[dict] | None = None) ->
     colors = [plddt_color(s) for s in scores]
 
     fig = go.Figure()
-
-    # Background bands
     fig.add_hrect(y0=90, y1=100, fillcolor="#0053D6", opacity=0.08, line_width=0)
     fig.add_hrect(y0=70, y1=90, fillcolor="#65CBF3", opacity=0.08, line_width=0)
     fig.add_hrect(y0=50, y1=70, fillcolor="#FFDB13", opacity=0.08, line_width=0)
@@ -240,7 +378,6 @@ def make_plddt_chart(residues: list[dict], domains: list[dict] | None = None) ->
         hovertemplate="Residue %{x}<br>pLDDT: %{y:.1f}<extra></extra>",
     ))
 
-    # Domain annotation overlays
     if domains:
         palette = px.colors.qualitative.Set2
         for i, dom in enumerate(domains):
@@ -278,21 +415,150 @@ def make_pae_heatmap(pae_data: dict) -> go.Figure:
     if isinstance(pae_data, list):
         pae_data = pae_data[0]
     pae_matrix = np.array(pae_data.get("predicted_aligned_error", pae_data.get("pae", [])))
-
     fig = go.Figure(data=go.Heatmap(
-        z=pae_matrix,
-        colorscale="Greens_r",
-        zmin=0, zmax=30,
+        z=pae_matrix, colorscale="Greens_r", zmin=0, zmax=30,
         colorbar=dict(title="PAE (Å)"),
         hovertemplate="Residue %{x} vs %{y}<br>PAE: %{z:.1f} Å<extra></extra>",
     ))
     fig.update_layout(
         title="Predicted Aligned Error (PAE)",
-        xaxis_title="Scored Residue",
-        yaxis_title="Aligned Residue",
-        height=500,
-        width=500,
-        yaxis=dict(autorange="reversed"),
+        xaxis_title="Scored Residue", yaxis_title="Aligned Residue",
+        height=500, width=500, yaxis=dict(autorange="reversed"),
+    )
+    return fig
+
+
+def make_ramachandran_plot(phi_psi: list[tuple[float, float]]) -> go.Figure:
+    """Create Ramachandran plot from phi/psi angles."""
+    if not phi_psi:
+        fig = go.Figure()
+        fig.update_layout(title="Ramachandran Plot — No backbone angles available")
+        return fig
+
+    phis = [p[0] for p in phi_psi]
+    psis = [p[1] for p in phi_psi]
+
+    fig = go.Figure()
+
+    # Favored regions (approximate)
+    # Alpha-helix region
+    fig.add_shape(type="rect", x0=-160, y0=-80, x1=-20, y1=40,
+                  fillcolor="rgba(0,83,214,0.08)", line=dict(width=0))
+    # Beta-sheet region
+    fig.add_shape(type="rect", x0=-180, y0=80, x1=-40, y1=180,
+                  fillcolor="rgba(101,203,243,0.08)", line=dict(width=0))
+    # Left-handed helix
+    fig.add_shape(type="rect", x0=20, y0=-60, x1=120, y1=80,
+                  fillcolor="rgba(255,219,19,0.08)", line=dict(width=0))
+
+    fig.add_trace(go.Scatter(
+        x=phis, y=psis, mode="markers",
+        marker=dict(size=4, color="#0053D6", opacity=0.6),
+        hovertemplate="Phi: %{x:.1f}°<br>Psi: %{y:.1f}°<extra></extra>",
+    ))
+
+    fig.update_layout(
+        title="Ramachandran Plot",
+        xaxis_title="Phi (°)", yaxis_title="Psi (°)",
+        xaxis=dict(range=[-180, 180], dtick=60),
+        yaxis=dict(range=[-180, 180], dtick=60),
+        height=500, width=500,
+        plot_bgcolor="white",
+        annotations=[
+            dict(x=-90, y=-30, text="α-helix", showarrow=False, font=dict(size=10, color="#0053D6")),
+            dict(x=-120, y=140, text="β-sheet", showarrow=False, font=dict(size=10, color="#65CBF3")),
+            dict(x=60, y=20, text="L-helix", showarrow=False, font=dict(size=10, color="#FFDB13")),
+        ],
+    )
+    return fig
+
+
+def make_aa_composition_chart(sequence: str) -> go.Figure:
+    """Bar chart of amino acid composition."""
+    counts = Counter(sequence)
+    aa_order = "ARNDCQEGHILKMFPSTWYV"
+    aa_names = {
+        "A": "Ala", "R": "Arg", "N": "Asn", "D": "Asp", "C": "Cys",
+        "Q": "Gln", "E": "Glu", "G": "Gly", "H": "His", "I": "Ile",
+        "L": "Leu", "K": "Lys", "M": "Met", "F": "Phe", "P": "Pro",
+        "S": "Ser", "T": "Thr", "W": "Trp", "Y": "Tyr", "V": "Val",
+    }
+    aa_list = [aa for aa in aa_order if aa in set(sequence)]
+    vals = [counts.get(aa, 0) for aa in aa_list]
+    pcts = [100 * v / len(sequence) for v in vals]
+
+    # Color by property
+    hydrophobic = set("AILMFWV")
+    charged = set("DEKRH")
+    polar = set("STNQCY")
+    colors = []
+    for aa in aa_list:
+        if aa in hydrophobic:
+            colors.append("#FF7D45")
+        elif aa in charged:
+            colors.append("#0053D6")
+        elif aa in polar:
+            colors.append("#65CBF3")
+        else:
+            colors.append("#FFDB13")
+
+    fig = go.Figure(go.Bar(
+        x=[f"{aa} ({aa_names.get(aa, aa)})" for aa in aa_list],
+        y=pcts,
+        marker_color=colors,
+        hovertemplate="%{x}<br>Count: " + str(vals).replace("[", "").replace("]", "").split(", ")[0] + "<br>%{y:.1f}%<extra></extra>",
+        customdata=list(zip(vals, pcts)),
+    ))
+    # Fix hover to show actual count per bar
+    fig.data[0].hovertemplate = None
+    fig.data[0].hoverinfo = "text"
+    fig.data[0].text = [f"{aa_names.get(aa, aa)}: {c} ({p:.1f}%)" for aa, c, p in zip(aa_list, vals, pcts)]
+
+    fig.update_layout(
+        title="Amino Acid Composition",
+        xaxis_title="Amino Acid", yaxis_title="Frequency (%)",
+        height=350, plot_bgcolor="white",
+        margin=dict(t=50, b=80),
+    )
+    return fig
+
+
+def make_hydrophobicity_plot(sequence: str, window: int = 9) -> go.Figure:
+    """Kyte-Doolittle hydrophobicity sliding window plot."""
+    values = compute_hydrophobicity(sequence, window)
+    if not values:
+        fig = go.Figure()
+        fig.update_layout(title="Hydrophobicity — Sequence too short for window")
+        return fig
+
+    positions = [v[0] for v in values]
+    scores = [v[1] for v in values]
+
+    fig = go.Figure()
+    fig.add_hline(y=0, line_dash="dash", line_color="grey", opacity=0.5)
+
+    # Color positive (hydrophobic) and negative (hydrophilic) differently
+    colors = ["#FF7D45" if s > 0 else "#0053D6" for s in scores]
+
+    fig.add_trace(go.Scatter(
+        x=positions, y=scores,
+        mode="lines",
+        line=dict(color="#555", width=1),
+        fill="tozeroy",
+        fillcolor="rgba(0,83,214,0.1)",
+        hovertemplate="Residue %{x}<br>Hydrophobicity: %{y:.2f}<extra></extra>",
+    ))
+
+    fig.update_layout(
+        title=f"Kyte-Doolittle Hydrophobicity (window={window})",
+        xaxis_title="Residue Number",
+        yaxis_title="Hydrophobicity Score",
+        height=350,
+        plot_bgcolor="white",
+        annotations=[
+            dict(x=1.02, y=0.9, xref="paper", yref="paper", text="Hydrophobic", font=dict(color="#FF7D45", size=10), showarrow=False, xanchor="left"),
+            dict(x=1.02, y=0.1, xref="paper", yref="paper", text="Hydrophilic", font=dict(color="#0053D6", size=10), showarrow=False, xanchor="left"),
+        ],
     )
     return fig
 
@@ -314,6 +580,25 @@ def render_3d_structure(pdb_text: str):
         st.code(pdb_text[:2000] + "\n... (truncated)", language="text")
 
 
+def render_overlay_3d(pdb_a: str, pdb_b: str, label_a: str = "A", label_b: str = "B"):
+    """Render two structures overlaid in one 3D viewer."""
+    try:
+        import py3Dmol
+        from stmol import showmol
+
+        view = py3Dmol.view(width=700, height=500)
+        view.addModel(pdb_a, "pdb")
+        view.setStyle({"model": 0}, {"cartoon": {"color": "#0053D6", "opacity": 0.8}})
+        view.addModel(pdb_b, "pdb")
+        view.setStyle({"model": 1}, {"cartoon": {"color": "#FF7D45", "opacity": 0.8}})
+        view.zoomTo()
+        view.setBackgroundColor("white")
+        showmol(view, height=500, width=700)
+        st.caption(f"Blue: {label_a} | Orange: {label_b}")
+    except ImportError:
+        st.warning("Install py3Dmol and stmol for 3D visualization.")
+
+
 def compute_structure_stats(residues: list[dict]) -> dict:
     """Compute summary statistics from pLDDT scores."""
     scores = [r["plddt"] for r in residues]
@@ -329,12 +614,15 @@ def compute_structure_stats(residues: list[dict]) -> dict:
     }
 
 
+# ── Helpers: PDF Report ────────────────────────────────────────────────
+
 def generate_pdf_report(
     title: str,
     stats: dict,
     plddt_fig: go.Figure,
     uniprot_id: str | None = None,
     domains: list[dict] | None = None,
+    seq_props: dict | None = None,
 ) -> bytes:
     """Generate PDF report as bytes for st.download_button."""
     from reportlab.lib import colors as rl_colors
@@ -375,6 +663,11 @@ def generate_pdf_report(
         ["% Confident (>70)", f"{stats['pct_confident']:.1f}%"],
         ["% Low (<=50)", f"{stats['pct_low']:.1f}%"],
     ]
+    if seq_props:
+        table_data.append(["Molecular Weight", f"{seq_props['molecular_weight']:.1f} Da"])
+        table_data.append(["Isoelectric Point", f"{seq_props['isoelectric_point']:.2f}"])
+        table_data.append(["GRAVY", f"{seq_props['gravy']:.3f}"])
+        table_data.append(["Instability Index", f"{seq_props['instability_index']:.1f}"])
     if domains:
         for dom in domains:
             table_data.append([f"Domain: {dom['name']}", f"Residues {dom['start']}-{dom['end']}"])
@@ -404,7 +697,7 @@ def generate_pdf_report(
         ))
 
     elements.append(Spacer(1, 0.3 * inch))
-    elements.append(Paragraph("<i>3D structure visualization available in the app.</i>", styles["Normal"]))
+    elements.append(Paragraph("<i>3D structure and Ramachandran plot available in the app.</i>", styles["Normal"]))
 
     # Footer
     elements.append(Spacer(1, 0.5 * inch))
@@ -451,17 +744,78 @@ def analyze_local_esm(sequence: str) -> dict | None:
         model, alphabet = esm_module.pretrained.esm2_t6_8M_UR50D()
         batch_converter = alphabet.get_batch_converter()
         model = model.eval()
-
         data = [("protein", sequence)]
         _, _, batch_tokens = batch_converter(data)
-
         with torch.no_grad():
             results = model(batch_tokens, repr_layers=[6], return_contacts=True)
-
         contact_map = results["contacts"][0].numpy()
         return {"contact_map": contact_map}
     except Exception:
         return None
+
+
+# ── Shared UI Components ───────────────────────────────────────────────
+
+def show_stats_row(stats: dict):
+    """Display the 4-column stats metrics row."""
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Residues", stats["num_residues"])
+    c2.metric("Mean pLDDT", f"{stats['mean_plddt']:.1f}")
+    c3.metric("% Very High (>90)", f"{stats['pct_very_high']:.0f}%")
+    c4.metric("% Low (<50)", f"{stats['pct_low']:.0f}%")
+
+
+def show_properties_tab(sequence: str):
+    """Display sequence properties panel."""
+    props = compute_sequence_properties(sequence)
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Molecular Weight", f"{props['molecular_weight']:.0f} Da")
+    col2.metric("Isoelectric Point (pI)", f"{props['isoelectric_point']:.2f}")
+    col3.metric("GRAVY", f"{props['gravy']:.3f}")
+
+    col4, col5, col6 = st.columns(3)
+    col4.metric("Instability Index", f"{props['instability_index']:.1f}")
+    col5.metric("Aromaticity", f"{props['aromaticity']:.3f}")
+    stability = "Stable" if props["instability_index"] < 40 else "Unstable"
+    col6.metric("Predicted Stability", stability)
+
+    # Secondary structure fractions (from sequence-based prediction)
+    st.markdown("**Predicted Secondary Structure (sequence-based)**")
+    ss_cols = st.columns(3)
+    ss_cols[0].metric("Helix", f"{props['helix_fraction'] * 100:.0f}%")
+    ss_cols[1].metric("Turn", f"{props['turn_fraction'] * 100:.0f}%")
+    ss_cols[2].metric("Sheet", f"{props['sheet_fraction'] * 100:.0f}%")
+
+    # AA composition chart
+    aa_fig = make_aa_composition_chart(sequence)
+    st.plotly_chart(aa_fig, use_container_width=True)
+
+    # Hydrophobicity plot
+    hydro_fig = make_hydrophobicity_plot(sequence)
+    st.plotly_chart(hydro_fig, use_container_width=True)
+
+    return props
+
+
+def show_ramachandran_tab(pdb_text: str):
+    """Display Ramachandran plot tab."""
+    phi_psi = calculate_phi_psi(pdb_text)
+    if phi_psi:
+        rama_fig = make_ramachandran_plot(phi_psi)
+        st.plotly_chart(rama_fig)
+        st.caption(f"{len(phi_psi)} residues with calculable backbone angles")
+
+        # Region distribution
+        alpha_count = sum(1 for p, s in phi_psi if -160 < p < -20 and -80 < s < 40)
+        beta_count = sum(1 for p, s in phi_psi if -180 < p < -40 and 80 < s < 180)
+        other_count = len(phi_psi) - alpha_count - beta_count
+        rc1, rc2, rc3 = st.columns(3)
+        rc1.metric("Alpha-helix region", f"{100 * alpha_count / len(phi_psi):.0f}%")
+        rc2.metric("Beta-sheet region", f"{100 * beta_count / len(phi_psi):.0f}%")
+        rc3.metric("Other regions", f"{100 * other_count / len(phi_psi):.0f}%")
+    else:
+        st.info("Cannot calculate Ramachandran angles — insufficient backbone atoms in PDB.")
 
 
 # ── Sidebar ─────────────────────────────────────────────────────────────
@@ -470,7 +824,13 @@ st.sidebar.markdown("---")
 
 mode = st.sidebar.radio(
     "Mode",
-    ["🔍 Lookup (AlphaFold DB)", "🧪 Fold (ESMFold)", "📦 Batch Fold", "⚖️ Compare"],
+    [
+        "🔍 Lookup (AlphaFold DB)",
+        "🧪 Fold (ESMFold)",
+        "📦 Batch Fold",
+        "⚖️ Compare",
+        "📂 Upload PDB",
+    ],
     index=0,
 )
 
@@ -478,15 +838,17 @@ st.sidebar.markdown("---")
 st.sidebar.markdown("""
 **About**
 
-**Lookup mode**: Search the AlphaFold DB (200M+ structures) by UniProt ID. Includes domain annotations.
+**Lookup**: Search AlphaFold DB (200M+ structures) by UniProt ID. Domain annotations, Ramachandran plot, sequence properties.
 
-**Fold mode**: Fold a novel sequence using ESMFold (max 400 residues). Optional local ESM-2 analysis.
+**Fold**: Fold a sequence with ESMFold (max 400 residues). Optional local ESM-2 analysis.
 
-**Batch Fold**: Upload a FASTA file and fold multiple sequences. Export stats as CSV.
+**Batch Fold**: Upload FASTA, fold multiple sequences, export CSV.
 
-**Compare**: Compare two proteins side by side — pLDDT charts and 3D structures.
+**Compare**: Side-by-side pLDDT, stats, 3D structures, and structure overlay.
 
-All modes include pLDDT confidence charts and PDF export.
+**Upload PDB**: Analyze your own PDB file — pLDDT, Ramachandran, properties.
+
+All modes include PDF export.
 """)
 
 st.sidebar.markdown("---")
@@ -513,7 +875,6 @@ if "🔍" in mode:
         search_btn = st.button("Search", use_container_width=True, type="primary")
 
     if search_btn and query:
-        # Check if it looks like a UniProt accession
         is_accession = bool(re.match(r"^[A-Z][0-9][A-Z0-9]{3}[0-9]$", query.strip().upper()))
 
         if is_accession:
@@ -524,24 +885,22 @@ if "🔍" in mode:
             if prediction:
                 st.success(f"Found AlphaFold prediction for **{uniprot_id}**")
 
-                # Fetch PDB + PAE + domains
-                pdb_text = fetch_alphafold_pdb(prediction)
-                pae_data = fetch_alphafold_pae(prediction)
+                pdb_url = prediction.get("pdbUrl")
+                pae_url = prediction.get("paeDocUrl")
+                pdb_text = fetch_alphafold_pdb(pdb_url) if pdb_url else None
+                pae_data = fetch_alphafold_pae(pae_url) if pae_url else None
                 domains = fetch_uniprot_domains(uniprot_id)
 
                 if pdb_text:
                     residues = parse_plddt_from_pdb(pdb_text)
                     stats = compute_structure_stats(residues)
+                    sequence = extract_sequence_from_pdb(pdb_text)
+                    show_stats_row(stats)
 
-                    # Stats row
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Residues", stats["num_residues"])
-                    c2.metric("Mean pLDDT", f"{stats['mean_plddt']:.1f}")
-                    c3.metric("% Very High (>90)", f"{stats['pct_very_high']:.0f}%")
-                    c4.metric("% Low (<50)", f"{stats['pct_low']:.0f}%")
-
-                    # Tabs for visualization
-                    tab1, tab2, tab3, tab4 = st.tabs(["📊 pLDDT Chart", "🔬 3D Structure", "🗺️ PAE Heatmap", "📥 Download"])
+                    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+                        "📊 pLDDT Chart", "🔬 3D Structure", "🗺️ PAE Heatmap",
+                        "🧬 Properties", "📐 Ramachandran", "📥 Download",
+                    ])
 
                     with tab1:
                         show_domains = st.checkbox("Show domain annotations", value=True) if domains else False
@@ -561,40 +920,39 @@ if "🔍" in mode:
                             st.info("PAE data not available for this prediction.")
 
                     with tab4:
+                        seq_props = show_properties_tab(sequence)
+
+                    with tab5:
+                        show_ramachandran_tab(pdb_text)
+
+                    with tab6:
                         st.download_button("Download PDB", pdb_text, f"AF-{uniprot_id}.pdb", "chemical/x-pdb")
                         if pae_data:
                             st.download_button("Download PAE JSON", json.dumps(pae_data), f"AF-{uniprot_id}-pae.json", "application/json")
-                        # PDF export
                         pdf_fig = make_plddt_chart(residues, domains=domains if domains else None)
                         pdf_bytes = generate_pdf_report(
                             title=f"AlphaFold Prediction — {uniprot_id}",
-                            stats=stats,
-                            plddt_fig=pdf_fig,
-                            uniprot_id=uniprot_id,
-                            domains=domains,
+                            stats=stats, plddt_fig=pdf_fig,
+                            uniprot_id=uniprot_id, domains=domains,
+                            seq_props=compute_sequence_properties(sequence),
                         )
                         st.download_button("📄 Export PDF Report", pdf_bytes, f"AF-{uniprot_id}-report.pdf", "application/pdf")
-
                 else:
                     st.error(f"PDB file not found for {uniprot_id}.")
             else:
                 st.warning(f"No AlphaFold prediction found for {uniprot_id}. Try searching by name instead.")
 
         else:
-            # Search by name
             with st.spinner(f"Searching UniProt for '{query}'..."):
                 results = search_uniprot(query)
-
             if results:
                 st.markdown(f"**{len(results)} results found.** Click a UniProt ID to load the structure.")
-
                 for r in results:
                     col_a, col_b, col_c, col_d = st.columns([1, 3, 2, 1])
                     col_a.code(r["accession"])
                     col_b.write(r["name"])
                     col_c.write(f"*{r['organism']}*")
                     col_d.write(f"{r['length']} aa")
-
                 st.info("Copy a UniProt accession from above and search again to load the full structure.")
             else:
                 st.warning(f"No results found for '{query}'.")
@@ -604,7 +962,6 @@ elif "🧪" in mode:
     st.title("ESMFold — Fold a Sequence")
     st.markdown("Fold a novel amino acid sequence using Meta's ESMFold. Max 400 residues.")
 
-    # Local ESM toggle
     esm_capability = check_local_esm_capabilities()
     use_local = False
     if esm_capability != "unavailable":
@@ -613,8 +970,7 @@ elif "🧪" in mode:
         st.caption("💡 Install `torch` and `fair-esm` for optional offline ESM-2 analysis")
 
     sequence_input = st.text_area(
-        "Amino acid sequence (FASTA or raw)",
-        height=150,
+        "Amino acid sequence (FASTA or raw)", height=150,
         placeholder=">my_protein\nMKTAYIAKQRQISFVKSHFSRQDLDALK...",
     )
 
@@ -646,19 +1002,13 @@ elif "🧪" in mode:
 
             if pdb_text:
                 st.success("Folding complete!")
-
                 residues = parse_plddt_from_pdb(pdb_text)
                 stats = compute_structure_stats(residues)
+                show_stats_row(stats)
 
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Residues", stats["num_residues"])
-                c2.metric("Mean pLDDT", f"{stats['mean_plddt']:.1f}")
-                c3.metric("% Very High (>90)", f"{stats['pct_very_high']:.0f}%")
-                c4.metric("% Low (<50)", f"{stats['pct_low']:.0f}%")
-
-                tab_names = ["📊 pLDDT Chart", "🔬 3D Structure", "📥 Download"]
+                tab_names = ["📊 pLDDT Chart", "🔬 3D Structure", "🧬 Properties", "📐 Ramachandran", "📥 Download"]
                 if analysis and "contact_map" in analysis:
-                    tab_names.insert(2, "🧠 Contact Map (ESM-2)")
+                    tab_names.insert(4, "🧠 Contact Map (ESM-2)")
 
                 tabs = st.tabs(tab_names)
 
@@ -669,8 +1019,14 @@ elif "🧪" in mode:
                 with tabs[1]:
                     render_3d_structure(pdb_text)
 
+                with tabs[2]:
+                    seq_props = show_properties_tab(sequence)
+
+                with tabs[3]:
+                    show_ramachandran_tab(pdb_text)
+
                 if analysis and "contact_map" in analysis:
-                    with tabs[2]:
+                    with tabs[4]:
                         st.markdown("**Predicted Contact Map** (ESM-2 local model)")
                         cm = analysis["contact_map"]
                         cm_fig = go.Figure(data=go.Heatmap(
@@ -679,17 +1035,18 @@ elif "🧪" in mode:
                         ))
                         cm_fig.update_layout(
                             xaxis_title="Residue", yaxis_title="Residue",
-                            height=500, width=500,
-                            yaxis=dict(autorange="reversed"),
+                            height=500, width=500, yaxis=dict(autorange="reversed"),
                         )
                         st.plotly_chart(cm_fig)
 
                 with tabs[-1]:
                     st.download_button("Download PDB", pdb_text, "esmfold_prediction.pdb", "chemical/x-pdb")
                     pdf_fig = make_plddt_chart(residues)
-                    pdf_bytes = generate_pdf_report(title="ESMFold Prediction", stats=stats, plddt_fig=pdf_fig)
+                    pdf_bytes = generate_pdf_report(
+                        title="ESMFold Prediction", stats=stats, plddt_fig=pdf_fig,
+                        seq_props=compute_sequence_properties(sequence),
+                    )
                     st.download_button("📄 Export PDF Report", pdf_bytes, "esmfold-report.pdf", "application/pdf")
-
             else:
                 st.error("ESMFold failed. The server may be busy — try a shorter sequence or try again in a few minutes.")
 
@@ -709,7 +1066,6 @@ elif "📦" in mode:
         elif len(sequences) > 20:
             st.error(f"Too many sequences ({len(sequences)}). Maximum is 20 per batch.")
         else:
-            # Validate all sequences
             valid_seqs = []
             skipped = []
             for name, seq in sequences:
@@ -742,19 +1098,16 @@ elif "📦" in mode:
                 progress.progress(1.0, text="Done!")
                 st.session_state["batch_results"] = results
 
-            # Display results from session state
             if "batch_results" in st.session_state and st.session_state["batch_results"]:
                 results = st.session_state["batch_results"]
                 st.markdown("### Results")
 
-                # Summary table
                 table_rows = []
                 for r in results:
                     if r["stats"]:
                         s = r["stats"]
                         table_rows.append({
-                            "Sequence": r["name"],
-                            "Length": s["num_residues"],
+                            "Sequence": r["name"], "Length": s["num_residues"],
                             "Mean pLDDT": f"{s['mean_plddt']:.1f}",
                             "Median pLDDT": f"{s['median_plddt']:.1f}",
                             "% Very High": f"{s['pct_very_high']:.0f}%",
@@ -763,25 +1116,19 @@ elif "📦" in mode:
                         })
                     else:
                         table_rows.append({
-                            "Sequence": r["name"],
-                            "Length": len(r["sequence"]),
-                            "Mean pLDDT": "FAILED",
-                            "Median pLDDT": "-",
-                            "% Very High": "-",
-                            "% Confident": "-",
-                            "% Low": "-",
+                            "Sequence": r["name"], "Length": len(r["sequence"]),
+                            "Mean pLDDT": "FAILED", "Median pLDDT": "-",
+                            "% Very High": "-", "% Confident": "-", "% Low": "-",
                         })
 
                 st.dataframe(table_rows, use_container_width=True)
 
-                # Expandable details per sequence
                 for r in results:
                     if r["stats"]:
                         with st.expander(f"{r['name']} — Mean pLDDT: {r['stats']['mean_plddt']:.1f}"):
                             batch_fig = make_plddt_chart(r["residues"])
                             st.plotly_chart(batch_fig, use_container_width=True)
 
-                # CSV export
                 csv_buf = StringIO()
                 writer = csv.DictWriter(csv_buf, fieldnames=[
                     "sequence_name", "length", "mean_plddt", "median_plddt",
@@ -792,8 +1139,7 @@ elif "📦" in mode:
                     if r["stats"]:
                         s = r["stats"]
                         writer.writerow({
-                            "sequence_name": r["name"],
-                            "length": s["num_residues"],
+                            "sequence_name": r["name"], "length": s["num_residues"],
                             "mean_plddt": f"{s['mean_plddt']:.2f}",
                             "median_plddt": f"{s['median_plddt']:.2f}",
                             "pct_very_high": f"{s['pct_very_high']:.1f}",
@@ -828,7 +1174,6 @@ elif "⚖️" in mode:
     if st.button("Compare", type="primary", use_container_width=True):
 
         def _fetch_protein(input_type: str, value: str, label: str):
-            """Returns (label, pdb_text, residues, stats) or None."""
             if input_type == "UniProt ID":
                 uid = value.strip().upper()
                 if not uid:
@@ -838,7 +1183,8 @@ elif "⚖️" in mode:
                 if not pred:
                     st.error(f"No AlphaFold prediction for {uid}")
                     return None
-                pdb = fetch_alphafold_pdb(pred)
+                pdb_url = pred.get("pdbUrl")
+                pdb = fetch_alphafold_pdb(pdb_url) if pdb_url else None
                 if not pdb:
                     st.error(f"PDB not found for {uid}")
                     return None
@@ -873,48 +1219,98 @@ elif "⚖️" in mode:
             cmp_fig.add_hrect(y0=50, y1=70, fillcolor="#FFDB13", opacity=0.08, line_width=0)
             cmp_fig.add_hrect(y0=0, y1=50, fillcolor="#FF7D45", opacity=0.08, line_width=0)
             cmp_fig.add_trace(go.Scatter(
-                x=[r["residue_num"] for r in res_a],
-                y=[r["plddt"] for r in res_a],
-                mode="lines", name=label_a,
-                line=dict(color="#0053D6", width=2),
+                x=[r["residue_num"] for r in res_a], y=[r["plddt"] for r in res_a],
+                mode="lines", name=label_a, line=dict(color="#0053D6", width=2),
             ))
             cmp_fig.add_trace(go.Scatter(
-                x=[r["residue_num"] for r in res_b],
-                y=[r["plddt"] for r in res_b],
-                mode="lines", name=label_b,
-                line=dict(color="#FF7D45", width=2),
+                x=[r["residue_num"] for r in res_b], y=[r["plddt"] for r in res_b],
+                mode="lines", name=label_b, line=dict(color="#FF7D45", width=2),
             ))
             cmp_fig.update_layout(
                 title="Per-Residue pLDDT Comparison",
-                xaxis_title="Residue Number",
-                yaxis_title="pLDDT Score",
-                yaxis=dict(range=[0, 100]),
-                height=400,
-                plot_bgcolor="white",
+                xaxis_title="Residue Number", yaxis_title="pLDDT Score",
+                yaxis=dict(range=[0, 100]), height=400, plot_bgcolor="white",
             )
             st.plotly_chart(cmp_fig, use_container_width=True)
 
             # Stats comparison
             st.markdown("### Statistics")
             metrics = ["num_residues", "mean_plddt", "median_plddt", "min_plddt", "max_plddt", "pct_very_high", "pct_confident", "pct_low"]
-            labels = ["Residues", "Mean pLDDT", "Median pLDDT", "Min pLDDT", "Max pLDDT", "% Very High (>90)", "% Confident (>70)", "% Low (<=50)"]
+            metric_labels = ["Residues", "Mean pLDDT", "Median pLDDT", "Min pLDDT", "Max pLDDT", "% Very High (>90)", "% Confident (>70)", "% Low (<=50)"]
             comp_rows = []
-            for metric, lbl in zip(metrics, labels):
+            for metric, lbl in zip(metrics, metric_labels):
                 va = stats_a[metric]
                 vb = stats_b[metric]
                 fmt = ".1f" if isinstance(va, float) else "d"
                 comp_rows.append({"Metric": lbl, label_a: f"{va:{fmt}}", label_b: f"{vb:{fmt}}"})
             st.dataframe(comp_rows, use_container_width=True)
 
-            # 3D structures side by side
+            # 3D structures: side by side + overlay
             st.markdown("### 3D Structures")
-            s_a, s_b = st.columns(2)
-            with s_a:
-                st.caption(label_a)
-                render_3d_structure(pdb_a)
-            with s_b:
-                st.caption(label_b)
-                render_3d_structure(pdb_b)
+            view_mode = st.radio("View", ["Side by Side", "Overlay"], horizontal=True, key="3d_view")
+
+            if view_mode == "Side by Side":
+                s_a, s_b = st.columns(2)
+                with s_a:
+                    st.caption(label_a)
+                    render_3d_structure(pdb_a)
+                with s_b:
+                    st.caption(label_b)
+                    render_3d_structure(pdb_b)
+            else:
+                render_overlay_3d(pdb_a, pdb_b, label_a, label_b)
+
+elif "📂" in mode:
+    # ── UPLOAD PDB MODE ──
+    st.title("Upload PDB — Analyze Your Structure")
+    st.markdown("Upload a PDB file to view pLDDT/B-factors, Ramachandran plot, and sequence properties.")
+
+    pdb_upload = st.file_uploader("Upload PDB file", type=["pdb", "ent"])
+
+    if pdb_upload:
+        pdb_text = pdb_upload.read().decode("utf-8")
+        residues = parse_plddt_from_pdb(pdb_text)
+
+        if not residues:
+            st.error("No CA atoms found in the uploaded PDB file.")
+        else:
+            stats = compute_structure_stats(residues)
+            sequence = extract_sequence_from_pdb(pdb_text)
+            st.success(f"Loaded structure: **{len(residues)} residues**")
+            show_stats_row(stats)
+
+            tab1, tab2, tab3, tab4, tab5 = st.tabs([
+                "📊 B-factor / pLDDT Chart", "🔬 3D Structure",
+                "🧬 Properties", "📐 Ramachandran", "📥 Download",
+            ])
+
+            with tab1:
+                fig = make_plddt_chart(residues)
+                fig.update_layout(title="Per-Residue B-factor / pLDDT")
+                st.plotly_chart(fig, use_container_width=True)
+
+            with tab2:
+                render_3d_structure(pdb_text)
+
+            with tab3:
+                if sequence and "X" not in sequence:
+                    seq_props = show_properties_tab(sequence)
+                else:
+                    st.warning("Could not extract clean amino acid sequence from PDB for property analysis.")
+
+            with tab4:
+                show_ramachandran_tab(pdb_text)
+
+            with tab5:
+                st.download_button("Download PDB", pdb_text, pdb_upload.name, "chemical/x-pdb")
+                pdf_fig = make_plddt_chart(residues)
+                props_for_pdf = compute_sequence_properties(sequence) if sequence and "X" not in sequence else None
+                pdf_bytes = generate_pdf_report(
+                    title=f"Uploaded Structure — {pdb_upload.name}",
+                    stats=stats, plddt_fig=pdf_fig,
+                    seq_props=props_for_pdf,
+                )
+                st.download_button("📄 Export PDF Report", pdf_bytes, f"{pdb_upload.name}-report.pdf", "application/pdf")
 
 # Footer
 st.markdown("---")
