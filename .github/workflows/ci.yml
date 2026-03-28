@@ -21,10 +21,11 @@ jobs:
         run: pip install -r requirements.txt pytest
 
       - name: Syntax check all modules
-        run: python -c "
-          import ast, sys;
-          files = ['app.py','analysis.py','api_clients.py','viz.py','ui_components.py','export_utils.py'];
-          [ast.parse(open(f).read()) for f in files];
+        run: |
+          python -c "
+          import ast
+          for f in ['app.py','analysis.py','api_clients.py','viz.py','ui_components.py','export_utils.py']:
+              ast.parse(open(f).read())
           print('All syntax OK')
           "
 
