@@ -686,12 +686,34 @@ def align_sequences(seq_a: str, seq_b: str) -> dict:
     aligner.extend_gap_score = -0.5
     alignments = aligner.align(seq_a, seq_b)
     best = alignments[0]
-    # Parse aligned sequences from str(alignment) — format: "SEQ_A\n||.|.\nSEQ_B\n"
-    aln_str = str(best)
-    lines = [l for l in aln_str.split("\n") if l.strip()]
-    # First line = aligned target (seq_a), last line = aligned query (seq_b), middle = match line
-    aligned_a = lines[0] if len(lines) >= 1 else seq_a
-    aligned_b = lines[-1] if len(lines) >= 3 else seq_b
+    # Build gapped alignment from aligned blocks
+    blocks_a = best.aligned[0]  # tuple of (start, end) for seq_a
+    blocks_b = best.aligned[1]  # tuple of (start, end) for seq_b
+    aligned_a_chars, aligned_b_chars = [], []
+    prev_a, prev_b = 0, 0
+    for (a_s, a_e), (b_s, b_e) in zip(blocks_a, blocks_b):
+        # Gaps before this block
+        gap_a = a_s - prev_a
+        gap_b = b_s - prev_b
+        if gap_a > 0:
+            aligned_a_chars.extend(list(seq_a[prev_a:a_s]))
+            aligned_b_chars.extend(["-"] * gap_a)
+        if gap_b > 0:
+            aligned_a_chars.extend(["-"] * gap_b)
+            aligned_b_chars.extend(list(seq_b[prev_b:b_s]))
+        # Aligned block
+        aligned_a_chars.extend(list(seq_a[a_s:a_e]))
+        aligned_b_chars.extend(list(seq_b[b_s:b_e]))
+        prev_a, prev_b = a_e, b_e
+    # Trailing unaligned residues
+    if prev_a < len(seq_a):
+        aligned_a_chars.extend(list(seq_a[prev_a:]))
+        aligned_b_chars.extend(["-"] * (len(seq_a) - prev_a))
+    if prev_b < len(seq_b):
+        aligned_a_chars.extend(["-"] * (len(seq_b) - prev_b))
+        aligned_b_chars.extend(list(seq_b[prev_b:]))
+    aligned_a = "".join(aligned_a_chars)
+    aligned_b = "".join(aligned_b_chars)
     # Calculate stats
     matrix = substitution_matrices.load("BLOSUM62")
     identity = gaps = similar = 0
