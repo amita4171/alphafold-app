@@ -408,3 +408,418 @@ def make_interaction_network_plot(interactions: list[dict]) -> go.Figure:
                       yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
                       height=550, width=550, plot_bgcolor="white")
     return fig
+
+
+# ── 19. Per-residue SASA bar chart ────────────────────────────────────
+def make_sasa_plot(sasa_data: list[dict]) -> go.Figure:
+    """Per-residue SASA bar chart colored by exposure level."""
+    if not sasa_data:
+        fig = go.Figure()
+        fig.update_layout(title="SASA — No data available")
+        return fig
+    residue_nums = [d["residue_num"] for d in sasa_data]
+    relative_sasa = [d["relative_sasa"] for d in sasa_data]
+    residue_names = [d["residue_name"] for d in sasa_data]
+    colors = []
+    for val in relative_sasa:
+        if val > 0.5:
+            colors.append("#0053D6")   # exposed — blue
+        elif val < 0.2:
+            colors.append("#FF7D45")   # buried — orange
+        else:
+            colors.append("#999999")   # intermediate — grey
+    fig = go.Figure(go.Bar(
+        x=residue_nums, y=relative_sasa, marker_color=colors,
+        hovertemplate="Residue %{x} (%{customdata})<br>Relative SASA: %{y:.3f}<extra></extra>",
+        customdata=residue_names,
+    ))
+    fig.update_layout(
+        title="Per-Residue Solvent Accessible Surface Area",
+        xaxis_title="Residue Number", yaxis_title="Relative SASA (0-1)",
+        yaxis=dict(range=[0, 1]),
+        height=400, plot_bgcolor="white",
+        margin=dict(t=50, b=50, l=60, r=20),
+        annotations=[
+            dict(x=1.02, y=0.9, xref="paper", yref="paper", text="Exposed (>0.5)",
+                 font=dict(color="#0053D6", size=10), showarrow=False, xanchor="left"),
+            dict(x=1.02, y=0.7, xref="paper", yref="paper", text="Intermediate",
+                 font=dict(color="#999999", size=10), showarrow=False, xanchor="left"),
+            dict(x=1.02, y=0.5, xref="paper", yref="paper", text="Buried (<0.2)",
+                 font=dict(color="#FF7D45", size=10), showarrow=False, xanchor="left"),
+        ],
+    )
+    return fig
+
+
+# ── 20. NMA mean-square fluctuations ──────────────────────────────────
+def make_nma_fluctuations_plot(sqflucts: list[float], residue_nums: list[int] | None = None) -> go.Figure:
+    """Line plot of mean square fluctuations from Normal Mode Analysis.
+
+    Peaks exceeding 2x the mean are highlighted in red.
+    """
+    if not sqflucts:
+        fig = go.Figure()
+        fig.update_layout(title="NMA Fluctuations — No data available")
+        return fig
+    if residue_nums is None:
+        residue_nums = list(range(1, len(sqflucts) + 1))
+    mean_val = float(np.mean(sqflucts))
+    threshold = 2.0 * mean_val
+    # Base line trace
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=residue_nums, y=sqflucts, mode="lines",
+        line=dict(color="#0053D6", width=1.5),
+        hovertemplate="Residue %{x}<br>Fluctuation: %{y:.4f}<extra></extra>",
+        name="Fluctuation",
+    ))
+    # Highlight peaks above threshold
+    peak_x = [r for r, f in zip(residue_nums, sqflucts) if f > threshold]
+    peak_y = [f for f in sqflucts if f > threshold]
+    if peak_x:
+        fig.add_trace(go.Scatter(
+            x=peak_x, y=peak_y, mode="markers",
+            marker=dict(color="red", size=6, symbol="circle"),
+            hovertemplate="Residue %{x}<br>Fluctuation: %{y:.4f} (peak)<extra></extra>",
+            name="Peak (>2x mean)",
+        ))
+    fig.add_hline(y=threshold, line_dash="dash", line_color="red", opacity=0.5,
+                  annotation_text=f"2x mean ({threshold:.4f})", annotation_position="top right")
+    fig.update_layout(
+        title="NMA Mean Square Fluctuations",
+        xaxis_title="Residue Number", yaxis_title="Mean Square Fluctuation",
+        height=400, plot_bgcolor="white",
+    )
+    return fig
+
+
+# ── 21. NMA cross-correlation heatmap ─────────────────────────────────
+def make_nma_cross_correlation(cross_corr: "np.ndarray") -> go.Figure:
+    """Heatmap of inter-residue cross-correlations from NMA."""
+    fig = go.Figure(data=go.Heatmap(
+        z=cross_corr,
+        colorscale="RdBu_r",
+        zmin=-1, zmax=1,
+        colorbar=dict(title="Correlation"),
+        hovertemplate="Residue %{x} vs %{y}<br>Correlation: %{z:.3f}<extra></extra>",
+    ))
+    fig.update_layout(
+        title="NMA Cross-Correlation Map",
+        xaxis_title="Residue", yaxis_title="Residue",
+        height=550, width=550,
+        yaxis=dict(autorange="reversed"),
+    )
+    return fig
+
+
+# ── 22. GNM B-factor comparison ───────────────────────────────────────
+def make_gnm_bfactor_comparison(
+    experimental: list[dict], predicted: list[tuple[int, float]]
+) -> go.Figure:
+    """Overlay plot of experimental vs GNM-predicted B-factors.
+
+    *experimental* — list of dicts with keys ``residue_num`` and ``bfactor``.
+    *predicted* — list of (residue_num, predicted_bfactor) tuples.
+    """
+    fig = go.Figure()
+    if experimental:
+        exp_nums = [d["residue_num"] for d in experimental]
+        exp_vals = [d.get("bfactor", d.get("plddt", 0)) for d in experimental]
+        fig.add_trace(go.Scatter(
+            x=exp_nums, y=exp_vals, mode="lines",
+            line=dict(color="#0053D6", width=1.5),
+            name="Experimental B-factor",
+            hovertemplate="Residue %{x}<br>B-factor: %{y:.2f}<extra></extra>",
+        ))
+    if predicted:
+        pred_nums = [p[0] for p in predicted]
+        pred_vals = [p[1] for p in predicted]
+        fig.add_trace(go.Scatter(
+            x=pred_nums, y=pred_vals, mode="lines",
+            line=dict(color="#FF7D45", width=1.5),
+            name="GNM Predicted",
+            hovertemplate="Residue %{x}<br>Predicted: %{y:.2f}<extra></extra>",
+        ))
+    fig.update_layout(
+        title="Experimental vs GNM-Predicted B-factors",
+        xaxis_title="Residue Number", yaxis_title="B-factor",
+        height=400, plot_bgcolor="white",
+        legend=dict(x=0.01, y=0.99, bgcolor="rgba(255,255,255,0.8)"),
+    )
+    return fig
+
+
+# ── 23. Enhanced protein-protein interaction network ──────────────────
+def make_ppi_network(interactions: list[dict]) -> go.Figure:
+    """Enhanced PPI network using networkx spring layout.
+
+    Each interaction dict should have keys: ``protein_a``, ``protein_b``,
+    ``combined_score``, and optionally ``score``.
+    """
+    import networkx as nx
+
+    if not interactions:
+        fig = go.Figure()
+        fig.update_layout(title="PPI Network — No interactions found")
+        return fig
+
+    G = nx.Graph()
+    for ix in interactions:
+        G.add_edge(
+            ix["protein_a"], ix["protein_b"],
+            weight=ix.get("combined_score", ix.get("score", 0.5)),
+        )
+
+    pos = nx.spring_layout(G, seed=42)
+
+    # Edges — width scaled by combined score
+    edge_traces: list[go.Scatter] = []
+    for u, v, data in G.edges(data=True):
+        x0, y0 = pos[u]
+        x1, y1 = pos[v]
+        weight = data.get("weight", 0.5)
+        edge_traces.append(go.Scatter(
+            x=[x0, x1, None], y=[y0, y1, None],
+            mode="lines",
+            line=dict(color="rgba(180,180,180,0.6)", width=1 + 3 * weight),
+            hoverinfo="none", showlegend=False,
+        ))
+
+    # Node properties
+    degrees = dict(G.degree())
+    proteins = list(G.nodes())
+    node_x = [pos[p][0] for p in proteins]
+    node_y = [pos[p][1] for p in proteins]
+    node_sizes = [10 + 4 * degrees[p] for p in proteins]
+
+    # Color by average interaction score
+    node_scores: list[float] = []
+    for p in proteins:
+        edges = G.edges(p, data=True)
+        avg_score = float(np.mean([d.get("weight", 0.5) for _, _, d in edges])) if edges else 0.5
+        node_scores.append(avg_score)
+
+    fig = go.Figure()
+    for trace in edge_traces:
+        fig.add_trace(trace)
+
+    fig.add_trace(go.Scatter(
+        x=node_x, y=node_y, mode="markers+text",
+        text=proteins, textposition="top center",
+        textfont=dict(size=10),
+        marker=dict(
+            size=node_sizes,
+            color=node_scores,
+            colorscale="Viridis",
+            colorbar=dict(title="Avg Score"),
+            line=dict(width=1, color="white"),
+        ),
+        hovertemplate="%{text}<br>Degree: %{customdata[0]}<br>Avg Score: %{customdata[1]:.3f}<extra></extra>",
+        customdata=list(zip([degrees[p] for p in proteins], node_scores)),
+        showlegend=False,
+    ))
+
+    fig.update_layout(
+        title="Protein-Protein Interaction Network",
+        showlegend=False,
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        height=600, width=600, plot_bgcolor="white",
+    )
+    return fig
+
+
+# ── 24. Sequence logo ─────────────────────────────────────────────────
+def make_sequence_logo(logo_data: dict) -> "matplotlib.figure.Figure":
+    """Sequence logo from per-position amino acid frequency matrix.
+
+    *logo_data* must contain key ``matrix`` — a pandas DataFrame of
+    per-position amino acid frequencies.
+    """
+    import logomaker
+    import matplotlib
+    import matplotlib.pyplot as plt
+
+    matrix = logo_data["matrix"]
+    fig, ax = plt.subplots(figsize=(max(10, len(matrix) * 0.3), 3))
+    logomaker.Logo(matrix, ax=ax)
+    ax.set_xlabel("Position")
+    ax.set_ylabel("Frequency")
+    ax.set_title("Sequence Logo")
+    plt.tight_layout()
+    return fig
+
+
+# ── 25. Phylogenetic tree (UPGMA dendrogram) ─────────────────────────
+def make_phylogenetic_tree(tree: dict) -> "matplotlib.figure.Figure":
+    """Draw a UPGMA tree as a horizontal dendrogram.
+
+    *tree* is a nested dict: ``{name, distance, children: [...]}``.
+    Leaf nodes have ``name`` set and no ``children`` (or empty list).
+    """
+    import matplotlib
+    import matplotlib.pyplot as plt
+
+    def _count_leaves(node: dict) -> int:
+        children = node.get("children", [])
+        if not children:
+            return 1
+        return sum(_count_leaves(c) for c in children)
+
+    def _draw(node: dict, ax, x: float, y_range: tuple[float, float]) -> float:
+        """Recursively draw the dendrogram. Returns the y-center of this node."""
+        children = node.get("children", [])
+        dist = node.get("distance", 0.0)
+
+        if not children:
+            # Leaf
+            y_center = (y_range[0] + y_range[1]) / 2.0
+            ax.text(x + 0.002, y_center, f"  {node.get('name', '')}", va="center", ha="left", fontsize=9)
+            return y_center
+
+        # Partition y-range among children proportionally to leaf count
+        total_leaves = _count_leaves(node)
+        child_centers: list[float] = []
+        y_start = y_range[0]
+        for child in children:
+            child_leaves = _count_leaves(child)
+            y_end = y_start + (y_range[1] - y_range[0]) * child_leaves / total_leaves
+            child_x = x + dist - child.get("distance", 0.0)
+            center = _draw(child, ax, child_x, (y_start, y_end))
+            child_centers.append(center)
+            # Horizontal line from child to this node's x
+            ax.plot([child_x, x + dist], [center, center], color="#0053D6", linewidth=1.2)
+            y_start = y_end
+
+        # Vertical connector line
+        ax.plot([x + dist, x + dist], [min(child_centers), max(child_centers)],
+                color="#0053D6", linewidth=1.2)
+
+        return (min(child_centers) + max(child_centers)) / 2.0
+
+    n_leaves = _count_leaves(tree)
+    fig, ax = plt.subplots(figsize=(8, max(4, n_leaves * 0.4)))
+    _draw(tree, ax, x=0.0, y_range=(0.0, float(n_leaves)))
+    ax.set_xlabel("Distance")
+    ax.set_title("UPGMA Phylogenetic Tree")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_visible(False)
+    ax.get_yaxis().set_visible(False)
+    plt.tight_layout()
+    return fig
+
+
+# ── 26. Topology diagram ──────────────────────────────────────────────
+def make_topology_diagram(topology: list[dict]) -> "matplotlib.figure.Figure":
+    """2D topology diagram: helices (red rectangles), strands (blue arrows),
+    coils (grey lines). Each element dict has keys: ``type``, ``start``, ``end``.
+    """
+    import matplotlib
+    import matplotlib.patches as patches
+    import matplotlib.pyplot as plt
+
+    if not topology:
+        fig, ax = plt.subplots(figsize=(6, 2))
+        ax.text(0.5, 0.5, "No topology data", ha="center", va="center", fontsize=12)
+        ax.set_axis_off()
+        return fig
+
+    fig, ax = plt.subplots(figsize=(max(10, len(topology) * 1.5), 4))
+    y_center = 0.5
+    x_cursor = 0.0
+    gap = 0.3
+
+    for elem in topology:
+        elem_type = elem.get("type", "coil").lower()
+        start = elem.get("start", 0)
+        end = elem.get("end", 0)
+        length = max(end - start + 1, 1)
+        width = length * 0.1  # scale factor
+
+        if elem_type == "helix":
+            rect = patches.FancyBboxPatch(
+                (x_cursor, y_center - 0.15), width, 0.3,
+                boxstyle="round,pad=0.02",
+                facecolor="#D9534F", edgecolor="#B52B27", linewidth=1.5,
+            )
+            ax.add_patch(rect)
+            ax.text(x_cursor + width / 2, y_center, f"H\n{start}-{end}",
+                    ha="center", va="center", fontsize=7, color="white", fontweight="bold")
+        elif elem_type == "strand":
+            # Arrow shape
+            arrow = patches.FancyArrow(
+                x_cursor, y_center, width, 0,
+                width=0.25, head_width=0.35, head_length=0.15,
+                fc="#337AB7", ec="#2A6496", linewidth=1.5,
+            )
+            ax.add_patch(arrow)
+            ax.text(x_cursor + width / 2, y_center, f"E\n{start}-{end}",
+                    ha="center", va="center", fontsize=7, color="white", fontweight="bold")
+        else:
+            # Coil — simple line
+            ax.plot([x_cursor, x_cursor + width], [y_center, y_center],
+                    color="#999999", linewidth=2, linestyle="-")
+            ax.text(x_cursor + width / 2, y_center + 0.2, f"{start}-{end}",
+                    ha="center", va="center", fontsize=6, color="#666666")
+
+        x_cursor += width + gap
+
+    ax.set_xlim(-0.5, x_cursor + 0.5)
+    ax.set_ylim(-0.2, 1.2)
+    ax.set_aspect("equal")
+    ax.set_title("Protein Topology Diagram")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_visible(False)
+    ax.spines["bottom"].set_visible(False)
+    ax.get_xaxis().set_visible(False)
+    ax.get_yaxis().set_visible(False)
+    plt.tight_layout()
+    return fig
+
+
+# ── 27. RMSD / TM-align summary ──────────────────────────────────────
+def make_rmsd_summary(rmsd_data: dict) -> str:
+    """Format TM-align results as a readable text block for ``st.code`` display."""
+    lines: list[str] = [
+        "=" * 50,
+        "  TM-align Structural Alignment Summary",
+        "=" * 50,
+        "",
+    ]
+    if "rmsd" in rmsd_data:
+        lines.append(f"  RMSD:              {rmsd_data['rmsd']:.3f} A")
+    if "tm_score" in rmsd_data:
+        tm = rmsd_data["tm_score"]
+        if isinstance(tm, (list, tuple)):
+            lines.append(f"  TM-score (chain 1): {tm[0]:.4f}")
+            if len(tm) > 1:
+                lines.append(f"  TM-score (chain 2): {tm[1]:.4f}")
+        else:
+            lines.append(f"  TM-score:          {tm:.4f}")
+    if "aligned_length" in rmsd_data:
+        lines.append(f"  Aligned length:    {rmsd_data['aligned_length']}")
+    if "seq_identity" in rmsd_data:
+        lines.append(f"  Sequence identity: {rmsd_data['seq_identity']:.1%}")
+    if "n_residues_a" in rmsd_data:
+        lines.append(f"  Residues (struct A): {rmsd_data['n_residues_a']}")
+    if "n_residues_b" in rmsd_data:
+        lines.append(f"  Residues (struct B): {rmsd_data['n_residues_b']}")
+
+    lines.append("")
+    lines.append("=" * 50)
+
+    # Interpretation
+    tm_val = rmsd_data.get("tm_score")
+    if tm_val is not None:
+        if isinstance(tm_val, (list, tuple)):
+            tm_val = max(tm_val)
+        if tm_val >= 0.5:
+            lines.append("  Interpretation: Same fold (TM-score >= 0.5)")
+        elif tm_val >= 0.17:
+            lines.append("  Interpretation: Possible structural similarity")
+        else:
+            lines.append("  Interpretation: Different folds (TM-score < 0.17)")
+
+    return "\n".join(lines)

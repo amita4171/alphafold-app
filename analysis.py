@@ -739,3 +739,434 @@ def score_substitutions(seq_a: str, seq_b: str) -> list[dict]:
         result.append({"position": i + 1, "aa_a": a, "aa_b": b,
                         "score": score, "is_conservative": score > 0})
     return result
+
+
+# ── Advanced structural analysis ─────────────────────────────────────────
+
+
+def calculate_sasa(pdb_text: str) -> list[dict] | None:
+    """Accurate per-residue solvent accessible surface area using freesasa.
+
+    Returns list of {residue_num, residue_name, sasa, relative_sasa} or None on failure.
+    """
+    try:
+        import freesasa
+        import tempfile
+        import os
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False) as f:
+            f.write(pdb_text)
+            tmppath = f.name
+        try:
+            structure = freesasa.Structure(tmppath)
+            result = freesasa.calc(structure)
+            residue_areas = result.residueAreas()
+            sasa_data = []
+            for chain_key, residues in residue_areas.items():
+                for res_num_str, area in residues.items():
+                    sasa_data.append({
+                        "residue_num": int(res_num_str) if isinstance(res_num_str, str) and res_num_str.lstrip('-').isdigit() else res_num_str,
+                        "residue_name": area.residueType,
+                        "sasa": area.total,
+                        "relative_sasa": area.relativeSASA if hasattr(area, 'relativeSASA') else area.total,
+                    })
+            sasa_data.sort(key=lambda x: x["residue_num"] if isinstance(x["residue_num"], int) else 0)
+            return sasa_data
+        finally:
+            os.unlink(tmppath)
+    except Exception:
+        return None
+
+
+def calculate_rmsd(pdb_a: str, pdb_b: str) -> dict | None:
+    """Calculate RMSD between two structures using tmtools.
+
+    Returns {rmsd, tm_score, aligned_length, seq_identity} or None on failure.
+    """
+    try:
+        import tmtools
+
+        def _extract_ca(pdb_text: str):
+            coords = []
+            seq = []
+            for line in pdb_text.split("\n"):
+                if line.startswith("ATOM") and line[12:16].strip() == "CA":
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    coords.append([x, y, z])
+                    res_name = line[17:20].strip()
+                    seq.append(THREE_TO_ONE.get(res_name, "X"))
+            return np.array(coords), "".join(seq)
+
+        coords_a, seq_a = _extract_ca(pdb_a)
+        coords_b, seq_b = _extract_ca(pdb_b)
+        if len(coords_a) == 0 or len(coords_b) == 0:
+            return None
+        res = tmtools.tm_align(coords_a, coords_b, seq_a, seq_b)
+        return {
+            "rmsd": float(res.rmsd),
+            "tm_score": float(res.tm_norm_chain1),
+            "aligned_length": int(res.aligned_length),
+            "seq_identity": float(res.seq_id),
+        }
+    except Exception:
+        return None
+
+
+def run_tm_align(pdb_a: str, pdb_b: str) -> dict | None:
+    """Full TM-align structural alignment.
+
+    Extract CA coordinates from both PDBs, run tmtools.tm_align().
+    Returns {tm_score_a, tm_score_b, rmsd, aligned_length, rotation_matrix,
+    translation_vector, aligned_residues_a, aligned_residues_b} or None on failure.
+    """
+    try:
+        import tmtools
+
+        def _extract_ca_with_residues(pdb_text: str):
+            coords = []
+            seq = []
+            res_nums = []
+            for line in pdb_text.split("\n"):
+                if line.startswith("ATOM") and line[12:16].strip() == "CA":
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    coords.append([x, y, z])
+                    res_name = line[17:20].strip()
+                    seq.append(THREE_TO_ONE.get(res_name, "X"))
+                    res_nums.append(int(line[22:26].strip()))
+            return np.array(coords), "".join(seq), res_nums
+
+        coords_a, seq_a, res_nums_a = _extract_ca_with_residues(pdb_a)
+        coords_b, seq_b, res_nums_b = _extract_ca_with_residues(pdb_b)
+        if len(coords_a) == 0 or len(coords_b) == 0:
+            return None
+        res = tmtools.tm_align(coords_a, coords_b, seq_a, seq_b)
+        aligned_len = sum(1 for c in res.seqM if c != ' ') if hasattr(res, 'seqM') else min(len(coords_a), len(coords_b))
+        return {
+            "tm_score_a": float(res.tm_norm_chain1),
+            "tm_score_b": float(res.tm_norm_chain2),
+            "rmsd": float(res.rmsd),
+            "aligned_length": aligned_len,
+            "rotation_matrix": res.u.tolist() if hasattr(res, 'u') else None,
+            "translation_vector": res.t.tolist() if hasattr(res, 't') else None,
+            "aligned_residues_a": res_nums_a,
+            "aligned_residues_b": res_nums_b,
+        }
+    except Exception:
+        return None
+
+
+def run_normal_mode_analysis(pdb_text: str, n_modes: int = 10) -> dict | None:
+    """Elastic network model NMA using ProDy.
+
+    Returns {eigenvalues, sqflucts, cross_correlations} or None on failure.
+    """
+    try:
+        import prody
+        import tempfile
+        import os
+
+        prody.confProDy(verbosity='none')
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False) as f:
+            f.write(pdb_text)
+            tmppath = f.name
+        try:
+            atoms = prody.parsePDB(tmppath)
+            calphas = atoms.select('calpha')
+            if calphas is None or len(calphas) < 3:
+                return None
+            anm = prody.ANM('protein')
+            anm.buildHessian(calphas)
+            anm.calcModes(n_modes)
+            sqflucts = prody.calcSqFlucts(anm).tolist()
+            eigenvalues = anm.getEigvals().tolist()
+            cross_corr = prody.calcCrossCorr(anm)
+            return {
+                "eigenvalues": eigenvalues,
+                "sqflucts": sqflucts,
+                "cross_correlations": cross_corr.tolist() if cross_corr is not None else None,
+            }
+        finally:
+            os.unlink(tmppath)
+    except Exception:
+        return None
+
+
+def calculate_gnm_bfactors(pdb_text: str) -> list[tuple[int, float]] | None:
+    """GNM-predicted B-factors using ProDy.
+
+    Returns list of (residue_num, predicted_bfactor) or None on failure.
+    """
+    try:
+        import prody
+        import tempfile
+        import os
+
+        prody.confProDy(verbosity='none')
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.pdb', delete=False) as f:
+            f.write(pdb_text)
+            tmppath = f.name
+        try:
+            atoms = prody.parsePDB(tmppath)
+            calphas = atoms.select('calpha')
+            if calphas is None or len(calphas) < 3:
+                return None
+            gnm = prody.GNM('protein')
+            gnm.buildKirchhoff(calphas)
+            gnm.calcModes()
+            sqflucts = prody.calcSqFlucts(gnm)
+            res_nums = calphas.getResnums().tolist()
+            return list(zip(res_nums, sqflucts.tolist()))
+        finally:
+            os.unlink(tmppath)
+    except Exception:
+        return None
+
+
+def build_sequence_distance_matrix(sequences: list[tuple[str, str]]) -> tuple[list[str], np.ndarray] | None:
+    """Compute all-vs-all sequence distance matrix for batch fold results.
+
+    Uses length-normalized edit distance (Levenshtein-like) between sequence pairs.
+    Returns (names, distance_matrix) or None on failure.
+    """
+    try:
+        if not sequences or len(sequences) < 2:
+            return None
+        names = [s[0] for s in sequences]
+        seqs = [s[1] for s in sequences]
+        n = len(seqs)
+        dist_matrix = np.zeros((n, n))
+
+        def _edit_distance(s1: str, s2: str) -> int:
+            """Simple dynamic programming edit distance."""
+            m, k = len(s1), len(s2)
+            dp = list(range(k + 1))
+            for i in range(1, m + 1):
+                prev = dp[0]
+                dp[0] = i
+                for j in range(1, k + 1):
+                    temp = dp[j]
+                    if s1[i - 1] == s2[j - 1]:
+                        dp[j] = prev
+                    else:
+                        dp[j] = 1 + min(prev, dp[j], dp[j - 1])
+                    prev = temp
+            return dp[k]
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                max_len = max(len(seqs[i]), len(seqs[j]))
+                if max_len == 0:
+                    dist = 0.0
+                else:
+                    dist = _edit_distance(seqs[i], seqs[j]) / max_len
+                dist_matrix[i, j] = dist
+                dist_matrix[j, i] = dist
+        return names, dist_matrix
+    except Exception:
+        return None
+
+
+def build_upgma_tree(names: list[str], dist_matrix: np.ndarray) -> dict | None:
+    """Build UPGMA phylogenetic tree from distance matrix.
+
+    Returns nested dict structure: {name, distance, children: [...]} or None on failure.
+    """
+    try:
+        n = len(names)
+        if n < 2 or dist_matrix.shape != (n, n):
+            return None
+        # Initialize clusters: each is a leaf node
+        clusters: list[dict] = [{"name": names[i], "distance": 0.0, "children": []} for i in range(n)]
+        # Track cluster sizes for weighted averaging
+        sizes = [1] * n
+        # Copy distance matrix so we can modify it
+        dm = dist_matrix.astype(float).copy()
+        np.fill_diagonal(dm, np.inf)
+        active = list(range(n))
+
+        while len(active) > 1:
+            # Find minimum distance pair among active clusters
+            min_dist = np.inf
+            mi, mj = -1, -1
+            for ii in range(len(active)):
+                for jj in range(ii + 1, len(active)):
+                    d = dm[active[ii], active[jj]]
+                    if d < min_dist:
+                        min_dist = d
+                        mi, mj = ii, jj
+            if mi == -1:
+                break
+            ci, cj = active[mi], active[mj]
+            # Create new merged cluster
+            new_node = {
+                "name": f"({clusters[ci]['name']},{clusters[cj]['name']})",
+                "distance": min_dist / 2.0,
+                "children": [clusters[ci], clusters[cj]],
+            }
+            # Update distance matrix: add new row/column by extending
+            new_idx = len(clusters)
+            clusters.append(new_node)
+            # Extend dm
+            new_dm = np.full((new_idx + 1, new_idx + 1), np.inf)
+            new_dm[:new_idx, :new_idx] = dm
+            si, sj = sizes[ci], sizes[cj]
+            for k in active:
+                if k == ci or k == cj:
+                    continue
+                new_d = (dm[ci, k] * si + dm[cj, k] * sj) / (si + sj)
+                new_dm[new_idx, k] = new_d
+                new_dm[k, new_idx] = new_d
+            dm = new_dm
+            sizes.append(si + sj)
+            # Update active list
+            active = [k for k in active if k != ci and k != cj]
+            active.append(new_idx)
+
+        return clusters[-1] if clusters else None
+    except Exception:
+        return None
+
+
+def compute_logo_data(sequences: list[str]) -> dict | None:
+    """Prepare data for sequence logo from a list of aligned sequences.
+
+    Compute per-position frequency matrix.
+    Returns {matrix: pd.DataFrame, consensus: str} where matrix has amino acids
+    as columns and positions as rows, or None on failure.
+    """
+    try:
+        import pandas as pd
+
+        if not sequences:
+            return None
+        # Ensure all sequences have the same length (pad shorter ones with '-')
+        max_len = max(len(s) for s in sequences)
+        padded = [s.ljust(max_len, '-') for s in sequences]
+        amino_acids = list("ACDEFGHIKLMNPQRSTVWY-")
+        n_seqs = len(padded)
+        freq_data = []
+        consensus = []
+        for pos in range(max_len):
+            counts = Counter(s[pos] for s in padded)
+            freqs = {aa: counts.get(aa, 0) / n_seqs for aa in amino_acids}
+            freq_data.append(freqs)
+            # Consensus is the most frequent non-gap character
+            non_gap = {aa: c for aa, c in counts.items() if aa != '-'}
+            if non_gap:
+                consensus.append(max(non_gap, key=non_gap.get))
+            else:
+                consensus.append('-')
+        matrix = pd.DataFrame(freq_data)
+        matrix.index = list(range(1, max_len + 1))
+        matrix.index.name = "position"
+        return {"matrix": matrix, "consensus": "".join(consensus)}
+    except Exception:
+        return None
+
+
+def assign_secondary_structure_from_coords(pdb_text: str) -> list[dict] | None:
+    """Assign secondary structure (H/E/C) from 3D coordinates.
+
+    Uses phi/psi angle-based assignment refined with backbone hydrogen bond
+    patterns: i->i+4 H-bonds indicate helices, i->i+2 for turns.
+    Returns list of {residue_num, ss} or None on failure.
+    """
+    try:
+        backbone = parse_backbone_atoms(pdb_text)
+        res_nums = sorted(backbone.keys())
+        if len(res_nums) < 5:
+            return None
+
+        # Get phi/psi-based initial assignment
+        phi_psi = calculate_phi_psi(pdb_text)
+        ss_initial = assign_ss_from_phi_psi(phi_psi)
+
+        # Build residue number -> ss index mapping
+        # phi_psi skips first and last residue, so it starts at res_nums[1]
+        inner_res = res_nums[1:-1] if len(res_nums) > 2 else res_nums
+        ss_map: dict[int, str] = {}
+        for i, rn in enumerate(inner_res):
+            if i < len(ss_initial):
+                ss_map[rn] = ss_initial[i]
+
+        # Detect backbone H-bonds for refinement
+        hbonds = detect_hydrogen_bonds(pdb_text, dist_threshold=3.5)
+        hbond_set: set[tuple[int, int]] = set()
+        for hb in hbonds:
+            hbond_set.add((hb["donor_res"], hb["acceptor_res"]))
+
+        # Refine: i->i+4 H-bond pattern => helix
+        for rn in res_nums:
+            if (rn, rn + 4) in hbond_set or (rn + 4, rn) in hbond_set:
+                for k in range(rn, rn + 5):
+                    if k in ss_map:
+                        ss_map[k] = "H"
+
+        # Refine: i->i+2 H-bond pattern => turn (keep as coil if not already helix)
+        for rn in res_nums:
+            if (rn, rn + 2) in hbond_set or (rn + 2, rn) in hbond_set:
+                for k in range(rn, rn + 3):
+                    if k in ss_map and ss_map[k] == "C":
+                        ss_map[k] = "C"  # turns remain coil
+
+        # Build full result including first/last residue as coil
+        result = []
+        for rn in res_nums:
+            result.append({"residue_num": rn, "ss": ss_map.get(rn, "C")})
+        return result
+    except Exception:
+        return None
+
+
+def generate_topology_data(pdb_text: str) -> list[dict] | None:
+    """Parse secondary structure elements into topology diagram data.
+
+    Returns list of {type: 'helix'|'strand'|'coil', start, end, length}
+    for drawing a 2D topology diagram, or None on failure.
+    """
+    try:
+        ss_data = assign_secondary_structure_from_coords(pdb_text)
+        if not ss_data:
+            return None
+
+        elements: list[dict] = []
+        current_type = None
+        current_start = None
+
+        type_map = {"H": "helix", "E": "strand", "C": "coil"}
+
+        prev_rn = None
+        for entry in ss_data:
+            ss = entry["ss"]
+            rn = entry["residue_num"]
+            elem_type = type_map.get(ss, "coil")
+
+            if elem_type != current_type:
+                if current_type is not None and current_start is not None and prev_rn is not None:
+                    elements.append({
+                        "type": current_type,
+                        "start": current_start,
+                        "end": prev_rn,
+                        "length": prev_rn - current_start + 1,
+                    })
+                current_type = elem_type
+                current_start = rn
+            prev_rn = rn
+
+        # Add the last element
+        if current_type is not None and current_start is not None and ss_data:
+            last_rn = ss_data[-1]["residue_num"]
+            elements.append({
+                "type": current_type,
+                "start": current_start,
+                "end": last_rn,
+                "length": last_rn - current_start + 1,
+            })
+
+        return elements
+    except Exception:
+        return None

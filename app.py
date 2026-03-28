@@ -31,7 +31,8 @@ from viz import (
 from ui_components import (
     show_stats_row, show_3d_tab, show_properties_tab, show_ramachandran_tab,
     show_structural_analysis_tab, show_annotations_tab, show_external_databases_tab,
-    show_compare_alignment_tab,
+    show_compare_alignment_tab, show_sasa_tab, show_nma_tab, show_topology_tab,
+    show_compare_structural_tab,
 )
 from export_utils import generate_pdf_report, export_analysis_json
 
@@ -149,7 +150,8 @@ if "🔍" in mode:
                         st.info(f"Multi-chain structure: {', '.join(chains)}")
 
                     tabs = st.tabs(["📊 pLDDT", "🔬 3D", "🗺️ PAE", "🧬 Properties",
-                                    "📐 Ramachandran", "🔩 Structural", "📚 Annotations",
+                                    "📐 Ramachandran", "🔩 Structural", "💧 SASA",
+                                    "🔄 Dynamics", "🧩 Topology", "📚 Annotations",
                                     "🌐 Databases", "📥 Export"])
 
                     with tabs[0]:
@@ -176,13 +178,22 @@ if "🔍" in mode:
                         show_structural_analysis_tab(pdb_text, residues)
 
                     with tabs[6]:
+                        show_sasa_tab(pdb_text)
+
+                    with tabs[7]:
+                        show_nma_tab(pdb_text, residues)
+
+                    with tabs[8]:
+                        show_topology_tab(pdb_text)
+
+                    with tabs[9]:
                         if uniprot_data:
                             show_annotations_tab(uniprot_data)
 
-                    with tabs[7]:
+                    with tabs[10]:
                         show_external_databases_tab(uniprot_id, sequence)
 
-                    with tabs[8]:
+                    with tabs[11]:
                         st.download_button("Download PDB", pdb_text, f"AF-{uniprot_id}.pdb", "chemical/x-pdb")
                         if pae_data:
                             st.download_button("Download PAE JSON", json.dumps(pae_data), f"AF-{uniprot_id}-pae.json")
@@ -253,9 +264,10 @@ elif "🧪" in mode:
                 stats = compute_structure_stats(residues)
                 show_stats_row(stats)
 
-                tab_names = ["📊 pLDDT", "🔬 3D", "🧬 Properties", "📐 Ramachandran", "🔩 Structural", "📥 Export"]
+                tab_names = ["📊 pLDDT", "🔬 3D", "🧬 Properties", "📐 Ramachandran",
+                             "🔩 Structural", "💧 SASA", "🔄 Dynamics", "🧩 Topology", "📥 Export"]
                 if analysis:
-                    tab_names.insert(5, "🧠 Contact Map")
+                    tab_names.insert(8, "🧠 Contact Map")
                 tabs = st.tabs(tab_names)
 
                 with tabs[0]: st.plotly_chart(make_plddt_chart(residues), use_container_width=True)
@@ -263,6 +275,9 @@ elif "🧪" in mode:
                 with tabs[2]: show_properties_tab(sequence)
                 with tabs[3]: show_ramachandran_tab(pdb_text)
                 with tabs[4]: show_structural_analysis_tab(pdb_text, residues)
+                with tabs[5]: show_sasa_tab(pdb_text)
+                with tabs[6]: show_nma_tab(pdb_text, residues)
+                with tabs[7]: show_topology_tab(pdb_text)
 
                 if analysis:
                     import plotly.graph_objects as go
@@ -437,17 +452,7 @@ elif "⚖️" in mode:
                 show_compare_alignment_tab(seq_a, seq_b, la, lb)
 
             with tabs[4]:
-                sc1, sc2 = st.columns(2)
-                with sc1:
-                    st.metric(f"Rg — {la}", f"{calculate_radius_of_gyration(pdb_a):.1f} Å")
-                    st.metric(f"SS bonds — {la}", len(detect_disulfide_bonds(pdb_a)))
-                    st.metric(f"Salt bridges — {la}", len(detect_salt_bridges(pdb_a)))
-                    st.metric(f"H-bonds — {la}", len(detect_hydrogen_bonds(pdb_a)))
-                with sc2:
-                    st.metric(f"Rg — {lb}", f"{calculate_radius_of_gyration(pdb_b):.1f} Å")
-                    st.metric(f"SS bonds — {lb}", len(detect_disulfide_bonds(pdb_b)))
-                    st.metric(f"Salt bridges — {lb}", len(detect_salt_bridges(pdb_b)))
-                    st.metric(f"H-bonds — {lb}", len(detect_hydrogen_bonds(pdb_b)))
+                show_compare_structural_tab(pdb_a, pdb_b, la, lb, res_a, res_b)
 
 # ═══════════════════════════════════════════════════════════════════════
 # UPLOAD PDB
@@ -469,7 +474,8 @@ elif "📂" in mode:
             st.success(f"Loaded: **{len(residues)} residues** | Chains: {', '.join(chains)}")
             show_stats_row(stats)
 
-            tabs = st.tabs(["📊 B-factor", "🔬 3D", "🧬 Properties", "📐 Ramachandran", "🔩 Structural", "📥 Export"])
+            tabs = st.tabs(["📊 B-factor", "🔬 3D", "🧬 Properties", "📐 Ramachandran",
+                            "🔩 Structural", "💧 SASA", "🔄 Dynamics", "🧩 Topology", "📥 Export"])
             with tabs[0]:
                 fig = make_plddt_chart(residues)
                 fig.update_layout(title="Per-Residue B-factor / pLDDT")
@@ -486,6 +492,12 @@ elif "📂" in mode:
             with tabs[4]:
                 show_structural_analysis_tab(pdb_text, residues)
             with tabs[5]:
+                show_sasa_tab(pdb_text)
+            with tabs[6]:
+                show_nma_tab(pdb_text, residues)
+            with tabs[7]:
+                show_topology_tab(pdb_text)
+            with tabs[8]:
                 st.download_button("Download PDB", pdb_text, pdb_upload.name, "chemical/x-pdb")
                 if "X" not in sequence:
                     st.download_button("Download FASTA", f">uploaded\n{sequence}\n", "uploaded.fasta", "text/plain")
