@@ -30,7 +30,7 @@ jobs:
           "
 
       - name: Run unit tests
-        run: pytest tests/ -v --tb=short -x
+        run: pytest tests/ -v --tb=short
 
   docker:
     runs-on: ubuntu-latest
