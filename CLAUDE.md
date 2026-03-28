@@ -26,5 +26,15 @@ Analysis: `freesasa tmtools prody networkx logomaker matplotlib`
 Export: `reportlab kaleido`
 Optional: `torch fair-esm`
 
+## Docker
+```bash
+docker build -t alphafold-explorer .
+docker compose up        # http://localhost:8501
+```
+- `Dockerfile`: python:3.11-slim, health check at `/_stcore/health`
+- `docker-compose.yml`: port 8501, restart unless-stopped
+- `.streamlit/config.toml`: AlphaFold blue theme, 50MB upload limit
+- Image: ~2.2GB
+
 ## External APIs (no auth)
 AlphaFold DB, ESMFold, UniProt, InterPro, STRING, Reactome, KEGG, MobiDB, RCSB PDB, PDBe, EBI Proteins, NCBI BLAST

@@ -9,6 +9,14 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+### Docker
+
+```bash
+docker build -t alphafold-explorer .
+docker compose up
+# Open http://localhost:8501
+```
+
 No API keys needed.
 
 ## Modes
