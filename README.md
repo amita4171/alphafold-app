@@ -83,6 +83,20 @@ export_utils.py     109 lines — PDF + JSON export
 Total:            3,433 lines
 ```
 
+## Testing
+
+```bash
+pytest tests/ -v    # 223 tests, 1.5 seconds, no network calls
+```
+
+## CI/CD
+
+GitHub Actions runs on every push: syntax check, 223 pytest tests, Docker build + health check.
+
+## Blog Post
+
+See [`docs/blog-post.md`](docs/blog-post.md) for a detailed technical writeup covering architecture, API integration, design decisions, and limitations.
+
 ## Optional: Local ESM-2
 
 ```bash

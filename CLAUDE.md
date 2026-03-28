@@ -36,5 +36,19 @@ docker compose up        # http://localhost:8501
 - `.streamlit/config.toml`: AlphaFold blue theme, 50MB upload limit
 - Image: ~2.2GB
 
+## Testing
+```bash
+pytest tests/ -v          # 223 tests, 1.5s
+```
+- `tests/test_analysis.py` — 1,501 lines, all 53 analysis functions
+- `tests/conftest.py` — mock PDB fixtures, no network calls
+- External libs (freesasa, tmtools, prody) mocked in tests
+
+## CI
+`.github/workflows/ci.yml` runs on push/PR to main:
+1. Syntax check (ast.parse all 6 modules)
+2. pytest (223 tests)
+3. Docker build + health check
+
 ## External APIs (no auth)
 AlphaFold DB, ESMFold, UniProt, InterPro, STRING, Reactome, KEGG, MobiDB, RCSB PDB, PDBe, EBI Proteins, NCBI BLAST
