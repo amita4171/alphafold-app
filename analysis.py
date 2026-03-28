@@ -686,22 +686,12 @@ def align_sequences(seq_a: str, seq_b: str) -> dict:
     aligner.extend_gap_score = -0.5
     alignments = aligner.align(seq_a, seq_b)
     best = alignments[0]
-    # Use format to get proper gapped alignment, then parse
-    fmt = best.format("fasta")
-    lines = fmt.strip().split("\n")
-    seqs = []
-    current = []
-    for line in lines:
-        if line.startswith(">"):
-            if current:
-                seqs.append("".join(current))
-                current = []
-        else:
-            current.append(line.strip())
-    if current:
-        seqs.append("".join(current))
-    aligned_a = seqs[0] if len(seqs) > 0 else seq_a
-    aligned_b = seqs[1] if len(seqs) > 1 else seq_b
+    # Parse aligned sequences from str(alignment) — format: "SEQ_A\n||.|.\nSEQ_B\n"
+    aln_str = str(best)
+    lines = [l for l in aln_str.split("\n") if l.strip()]
+    # First line = aligned target (seq_a), last line = aligned query (seq_b), middle = match line
+    aligned_a = lines[0] if len(lines) >= 1 else seq_a
+    aligned_b = lines[-1] if len(lines) >= 3 else seq_b
     # Calculate stats
     matrix = substitution_matrices.load("BLOSUM62")
     identity = gaps = similar = 0
